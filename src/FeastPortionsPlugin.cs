@@ -54,10 +54,12 @@ namespace FeastPortions
         private static ConfigEntry<bool> _takePortions;
         private static ConfigEntry<bool> _leftovers;
         private static ConfigEntry<bool> _removeEmpty;
+        private static ConfigEntry<bool> _dropAsFeast;
         private static ConfigEntry<float> _minutes;
 
         private static readonly Dictionary<string, FeastInfo> _byPiece = new Dictionary<string, FeastInfo>(StringComparer.Ordinal);
         private static readonly Dictionary<string, FeastInfo> _byFood = new Dictionary<string, FeastInfo>(StringComparer.Ordinal);
+        private static readonly Dictionary<string, FeastInfo> _byPortion = new Dictionary<string, FeastInfo>(StringComparer.Ordinal);
         private static readonly Dictionary<ZDOID, Bite> _bites = new Dictionary<ZDOID, Bite>();
         private static GameObject _root;
         private static bool _removing;
@@ -70,6 +72,8 @@ namespace FeastPortions
                 "Shift + E (alt use) on a placed feast puts one portion into the inventory instead of eating it.");
             _leftovers = Config.Bind("01 General", "LeftoversOnRemove", true,
                 "Taking up a started feast with the serving tray gives the portions left (the game gives nothing). A whole feast still comes back whole.");
+            _dropAsFeast = Config.Bind("01 General", "DropAsFeast", true,
+                "Dropped portions are set out as a feast with that many portions. Off: they drop as ordinary items.");
             _removeEmpty = Config.Bind("01 General", "RemoveEmptyFeast", true,
                 "The empty serving tray disappears once you take or eat the last portion (the game leaves it standing).");
             _minutes = Config.Bind("02 Portions", "Duration", 25f,
@@ -78,7 +82,14 @@ namespace FeastPortions
             _minutes.SettingChanged += delegate { foreach (FeastInfo f in _byPiece.Values) Dress(f); };
 
             _harmony = new Harmony(Guid);
-            _harmony.PatchAll(typeof(FeastPortionsPlugin).Assembly);
+            // one patch class at a time: a patch the game no longer fits is logged and skipped
+            // instead of taking every other patch down with it
+            foreach (Type t in typeof(FeastPortionsPlugin).GetNestedTypes(BindingFlags.NonPublic))
+            {
+                if (t.GetCustomAttributes(typeof(HarmonyPatch), false).Length == 0) continue;
+                try { _harmony.CreateClassProcessor(t).Patch(); }
+                catch (Exception e) { Logger.LogError("Patch " + t.Name + " failed: " + e.Message); }
+            }
             Logger.LogInfo(Name + " " + Version + " loaded.");
         }
 
@@ -151,6 +162,7 @@ namespace FeastPortions
             Dress(info);
             _byPiece[piece.name] = info;
             _byFood[food.gameObject.name] = info;
+            _byPortion[go.name] = info;
             return info;
         }
 
@@ -281,6 +293,39 @@ namespace FeastPortions
             return given;
         }
 
+        private static FeastInfo InfoOf(ItemDrop.ItemData item)
+        {
+            FeastInfo info;
+            if (item == null || item.m_dropPrefab == null) return null;
+            return _byPortion.TryGetValue(item.m_dropPrefab.name, out info) ? info : null;
+        }
+
+        // Sets out a feast (or several, one per full feast) with the given portions at a point.
+        private static void SetOut(FeastInfo info, int portions, Vector3 pos, Quaternion rot)
+        {
+            while (portions > 0)
+            {
+                int n = Math.Min(portions, info.Portions);
+                portions -= n;
+                GameObject go = UnityEngine.Object.Instantiate(info.Piece, pos, rot);
+                ZNetView nview = go.GetComponent<ZNetView>();
+                if (nview != null && nview.IsValid()) nview.GetZDO().Set(ZDOVars.s_value, n, false);
+                pos += rot * new Vector3(0.6f, 0f, 0f);
+            }
+        }
+
+        // The ground under a point (terrain, pieces, rocks), or false over water and the void.
+        private static bool Ground(Vector3 from, out Vector3 point)
+        {
+            point = from;
+            int mask = LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain", "vehicle");
+            RaycastHit hit;
+            if (!Physics.Raycast(from + Vector3.up * 1.5f, Vector3.down, out hit, 6f, mask)) return false;
+            if (ZoneSystem.instance != null && hit.point.y < ZoneSystem.instance.m_waterLevel - 0.3f) return false;
+            point = hit.point;
+            return true;
+        }
+
         // Takes an emptied feast away: the owner removes it, dropping nothing.
         private static void RemoveEmpty(Feast feast)
         {
@@ -310,7 +355,7 @@ namespace FeastPortions
         }
 
         // An early build put the feast's food item itself into inventories: those become portions.
-        [HarmonyPatch(typeof(Inventory), "Load")]
+        [HarmonyPatch(typeof(Inventory), "Load", new Type[] { typeof(ZPackage) })]
         private static class Inventory_Load_Patch
         {
             private static void Postfix(Inventory __instance)
@@ -405,6 +450,51 @@ namespace FeastPortions
                 if (Vector3.Distance(Player.m_localPlayer.transform.position, __instance.transform.position) >= __instance.m_useDistance) return;
                 __result += Localization.instance.Localize("\n[<color=yellow><b>$KEY_AltPlace + $KEY_Use</b></color>] ")
                     + T("Take a portion", "Взять кусочек");
+            }
+        }
+
+        // ---- dropping portions ----
+
+        // The player drops portions: they are set out as a feast in front of the player.
+        [HarmonyPatch(typeof(Humanoid), "DropItem")]
+        private static class Humanoid_DropItem_Patch
+        {
+            private static bool Prefix(Humanoid __instance, Inventory inventory, ItemDrop.ItemData item, int amount, ref bool __result)
+            {
+                FeastInfo info = InfoOf(item);
+                if (info == null || !_dropAsFeast.Value) return true;
+                __result = false;
+                Vector3 at;
+                if (!Ground(__instance.transform.position + __instance.transform.forward * 1.2f, out at))
+                {
+                    __instance.Message(MessageHud.MessageType.Center, "$msg_cantdrop", 0, null, false);
+                    return false;
+                }
+                if (inventory == null) inventory = __instance.GetInventory();
+                if (amount <= 0 || amount > item.m_stack) amount = item.m_stack;
+                if (!inventory.RemoveItem(item, amount)) return false;
+                Quaternion rot = Quaternion.Euler(0f, __instance.transform.rotation.eulerAngles.y + 180f, 0f);
+                SetOut(info, amount, at, rot);
+                __result = true;
+                return false;
+            }
+        }
+
+        // Anything else dropping portions into the world (a full inventory, a destroyed chest or
+        // cart spilling its contents): a feast with that many portions as well.
+        [HarmonyPatch(typeof(ItemDrop), "DropItem")]
+        private static class ItemDrop_DropItem_Patch
+        {
+            private static bool Prefix(ItemDrop.ItemData item, int amount, Vector3 position, Quaternion rotation, ref ItemDrop __result)
+            {
+                FeastInfo info = InfoOf(item);
+                if (info == null || !_dropAsFeast.Value) return true;
+                if (amount <= 0 || amount > item.m_stack) amount = item.m_stack;
+                Vector3 at;
+                if (!Ground(position, out at)) at = position;
+                SetOut(info, amount, at, Quaternion.Euler(0f, rotation.eulerAngles.y, 0f));
+                __result = null;
+                return false;
             }
         }
 

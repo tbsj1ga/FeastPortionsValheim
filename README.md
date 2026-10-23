@@ -18,7 +18,10 @@ Version history is in `CHANGELOG.md`.
   hotbar or the food slots of a slot mod. Portions stack to ten (a feast's portion count), never
   with feasts, and cannot be set out as a feast.
 - **Serving tray on a started feast:** you get the portions left. What does not fit into the
-  inventory drops at your feet. A whole feast comes back whole, as in the game.
+  inventory is set out where you stand. A whole feast comes back whole, as in the game.
+- **Dropping portions** sets them out in front of you as a feast with that many portions (ten per
+  feast), so the group can eat from it or you can take them back. Portions spilled from a
+  destroyed chest or cart become a feast the same way.
 - **The empty tray** disappears once the last portion is taken or eaten (the game leaves it
   standing).
 
@@ -35,13 +38,16 @@ bite.
   copied through a render texture) and duration. It cannot be the food item itself: the inventory
   stacks items and counts build materials by `SharedData.m_name`, and the feast's food shares its
   name with the kit the tray places. The portions are registered in `ObjectDB` (the inventory
-  saves items by prefab name) and `ZNetScene` (so a dropped portion lies in the world).
+  saves items by prefab name) and `ZNetScene`.
 - **Taking a portion.** Shift + E sends the feast's own `RPC_TryEat`; its owner counts a portion
   off and answers `RPC_EatConfirmation`, where this client puts the portion into the inventory
   instead of eating it. The owner needs no mod.
 - **Leftovers.** While `Player.RemovePiece` runs, a prefix on `WearNTear.Remove` (reached only once
   every check has passed) reads the portions left of a started feast and puts them into the
   inventory; the game then removes the feast as usual.
+- **Dropping.** `Humanoid.DropItem` and `ItemDrop.DropItem` set dropped portions out as a feast
+  with exactly that many portions, on the ground under the drop point (with `DropAsFeast` off,
+  they drop as ordinary items).
 - **The empty tray.** When the portion taken or eaten was the last one, the client asks the
   feast's owner to remove it (`WearNTear.Remove`, dropping nothing).
 
@@ -50,8 +56,8 @@ bite.
 - Works alongside FeastMaster and other mods that change servings: the portion count is read from
   the feast.
 - Feasts added by other mods are covered if they use the game's `Feast` component.
-- A portion dropped on the ground is seen only by players who have the mod. If the mod is removed,
-  portions disappear from inventories.
+- If the mod is removed, portions disappear from inventories. With `DropAsFeast` off, a portion
+  lying on the ground is seen only by players who have the mod.
 
 Built against **Valheim 1.0.20** (network version 41), **BepInEx 5.4.23.5**
 (BepInExPack_Valheim 5.4.2351).
@@ -86,6 +92,7 @@ Through r2modman / Thunderstore, or put `build/FeastPortions.dll` into
 |---|---|---|---|
 | 01 General | `TakePortions` | `true` | Shift + E on a feast puts a portion into the inventory |
 | 01 General | `LeftoversOnRemove` | `true` | the serving tray returns the portions left of a started feast |
+| 01 General | `DropAsFeast` | `true` | dropped portions are set out as a feast; off: they drop as ordinary items |
 | 01 General | `RemoveEmptyFeast` | `true` | the empty tray disappears after the last portion is taken or eaten |
 | 02 Portions | `Duration` | `25` | how long a portion lasts once eaten, in minutes (a feast: 50) |
 

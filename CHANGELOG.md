@@ -11,4 +11,5 @@ The version is set in one place — `FeastPortionsPlugin.Version` in `src/FeastP
   it lasts 25 minutes (configurable) and stacks to ten. Portions never stack with feasts and
   cannot be set out as a feast.
 - Taking up a started feast with the serving tray gives the portions left instead of nothing.
+- Dropped portions are set out as a feast with that many portions.
 - The empty serving tray disappears once the last portion is taken or eaten.
