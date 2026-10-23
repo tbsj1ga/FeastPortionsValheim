@@ -48,7 +48,9 @@ namespace FeastPortions
         {
             public float Time;
             public bool Take;               // into the inventory, not eaten
-            public bool Last;               // the feast had one portion left
+            public int Need;                // confirmations still to come for this take
+            public bool Given;              // the portion is already in the inventory
+            public bool Last;               // this bite empties the feast
         }
 
         private static ConfigEntry<bool> _takePortions;
@@ -56,6 +58,7 @@ namespace FeastPortions
         private static ConfigEntry<bool> _removeEmpty;
         private static ConfigEntry<bool> _dropAsFeast;
         private static ConfigEntry<float> _minutes;
+        private static ConfigEntry<int> _cost;
 
         private static readonly Dictionary<string, FeastInfo> _byPiece = new Dictionary<string, FeastInfo>(StringComparer.Ordinal);
         private static readonly Dictionary<string, FeastInfo> _byFood = new Dictionary<string, FeastInfo>(StringComparer.Ordinal);
@@ -73,10 +76,13 @@ namespace FeastPortions
             _leftovers = Config.Bind("01 General", "LeftoversOnRemove", true,
                 "Taking up a started feast with the serving tray gives the portions left (the game gives nothing). A whole feast still comes back whole.");
             _dropAsFeast = Config.Bind("01 General", "DropAsFeast", true,
-                "Dropped portions are set out as a feast with that many portions. Off: they drop as ordinary items.");
+                "Dropped portions are set out as a feast again, with the servings they took. Off: they drop as ordinary items.");
             _removeEmpty = Config.Bind("01 General", "RemoveEmptyFeast", true,
                 "The empty serving tray disappears once you take or eat the last portion (the game leaves it standing).");
-            _minutes = Config.Bind("02 Portions", "Duration", 25f,
+            _cost = Config.Bind("02 Portions", "Cost", 2,
+                new ConfigDescription("Servings of the feast one carried portion takes. Eating at the table always takes one.",
+                    new AcceptableValueRange<int>(1, 5)));
+            _minutes = Config.Bind("02 Portions", "Duration", 30f,
                 new ConfigDescription("How long a portion lasts once eaten, in minutes. A feast eaten at the table lasts 50.",
                     new AcceptableValueRange<float>(1f, 120f)));
             _minutes.SettingChanged += delegate { foreach (FeastInfo f in _byPiece.Values) Dress(f); };
@@ -300,13 +306,18 @@ namespace FeastPortions
             return _byPortion.TryGetValue(item.m_dropPrefab.name, out info) ? info : null;
         }
 
-        // Sets out a feast (or several, one per full feast) with the given portions at a point.
-        private static void SetOut(FeastInfo info, int portions, Vector3 pos, Quaternion rot)
+        private static int Cost()
         {
-            while (portions > 0)
+            return Mathf.Clamp(_cost.Value, 1, 5);
+        }
+
+        // Sets out a feast (or several, one per full feast) with the given servings at a point.
+        private static void SetOut(FeastInfo info, int servings, Vector3 pos, Quaternion rot)
+        {
+            while (servings > 0)
             {
-                int n = Math.Min(portions, info.Portions);
-                portions -= n;
+                int n = Math.Min(servings, info.Portions);
+                servings -= n;
                 GameObject go = UnityEngine.Object.Instantiate(info.Piece, pos, rot);
                 ZNetView nview = go.GetComponent<ZNetView>();
                 if (nview != null && nview.IsValid()) nview.GetZDO().Set(ZDOVars.s_value, n, false);
@@ -383,6 +394,7 @@ namespace FeastPortions
                 Bite bite = new Bite();
                 bite.Time = Time.time;
                 bite.Last = left == 1;
+                int cost = Cost();
 
                 if (!alt || !_takePortions.Value)
                 {
@@ -394,6 +406,11 @@ namespace FeastPortions
                 __result = false;
                 Player player = human as Player;
                 if (player == null || player != Player.m_localPlayer || left <= 0) return false;
+                if (left < cost)
+                {
+                    player.Message(MessageHud.MessageType.Center, T("Too little left to take - eat it here", "Слишком мало, чтобы взять с собой — съешьте здесь"), 0, null, false);
+                    return false;
+                }
                 if (Vector3.Distance(player.transform.position, __instance.transform.position) >= __instance.m_useDistance) return false;
                 FeastInfo info = InfoOf(__instance);
                 if (info == null) return false;
@@ -402,9 +419,12 @@ namespace FeastPortions
                     player.Message(MessageHud.MessageType.Center, "$inventory_full", 0, null, false);
                     return false;
                 }
+                // one RPC_TryEat per serving: the owner counts each off and confirms each
                 bite.Take = true;
+                bite.Need = cost;
+                bite.Last = left == cost;
                 _bites[nview.GetZDO().m_uid] = bite;
-                nview.InvokeRPC("RPC_TryEat", new object[0]);
+                for (int i = 0; i < cost; i++) nview.InvokeRPC("RPC_TryEat", new object[0]);
                 __result = true;
                 return false;
             }
@@ -423,13 +443,25 @@ namespace FeastPortions
                 ZDOID id = nview.GetZDO().m_uid;
                 Bite bite;
                 if (!_bites.TryGetValue(id, out bite)) return true;
-                _bites.Remove(id);
-                if (Time.time - bite.Time > 5f) return true;
-                __state = bite;
-                if (!bite.Take) return true;
+                if (Time.time - bite.Time > 5f) { _bites.Remove(id); return true; }
+                if (!bite.Take)
+                {
+                    _bites.Remove(id);
+                    __state = bite;
+                    return true;
+                }
+                // a take: the portion comes with the first confirmation, the rest only count
+                bite.Need--;
+                if (bite.Need <= 0)
+                {
+                    _bites.Remove(id);
+                    __state = bite;
+                }
+                if (bite.Given) return false;
+                bite.Given = true;
                 Player player = Player.m_localPlayer;
                 FeastInfo info = InfoOf(__instance);
-                if (player == null || info == null) return true;
+                if (player == null || info == null) return false;
                 if (Give(player, info, 1) > 0)
                     player.Message(MessageHud.MessageType.TopLeft, "$msg_added " + info.Shared.m_name, 1, info.Shared.m_icons[0], false);
                 return false;
@@ -448,8 +480,12 @@ namespace FeastPortions
             {
                 if (!_takePortions.Value || string.IsNullOrEmpty(__result) || Player.m_localPlayer == null) return;
                 if (Vector3.Distance(Player.m_localPlayer.transform.position, __instance.transform.position) >= __instance.m_useDistance) return;
-                __result += Localization.instance.Localize("\n[<color=yellow><b>$KEY_AltPlace + $KEY_Use</b></color>] ")
-                    + T("Take a portion", "Взять кусочек");
+                int cost = Cost();
+                string what = T("Take a portion", "Взять кусочек") + (cost > 1 ? T(" (" + cost + " servings)", " (" + cost + " куска)") : "");
+                if (PortionsLeft(__instance) < cost)
+                    __result += "\n<color=#888888>" + what + "</color>";
+                else
+                    __result += Localization.instance.Localize("\n[<color=yellow><b>$KEY_AltPlace + $KEY_Use</b></color>] ") + what;
             }
         }
 
@@ -474,7 +510,7 @@ namespace FeastPortions
                 if (amount <= 0 || amount > item.m_stack) amount = item.m_stack;
                 if (!inventory.RemoveItem(item, amount)) return false;
                 Quaternion rot = Quaternion.Euler(0f, __instance.transform.rotation.eulerAngles.y + 180f, 0f);
-                SetOut(info, amount, at, rot);
+                SetOut(info, amount * Cost(), at, rot);
                 __result = true;
                 return false;
             }
@@ -492,7 +528,7 @@ namespace FeastPortions
                 if (amount <= 0 || amount > item.m_stack) amount = item.m_stack;
                 Vector3 at;
                 if (!Ground(position, out at)) at = position;
-                SetOut(info, amount, at, Quaternion.Euler(0f, rotation.eulerAngles.y, 0f));
+                SetOut(info, amount * Cost(), at, Quaternion.Euler(0f, rotation.eulerAngles.y, 0f));
                 __result = null;
                 return false;
             }
@@ -522,7 +558,8 @@ namespace FeastPortions
                 if (info == null) return;
                 int left = PortionsLeft(feast);
                 if (left <= 0 || left >= feast.m_eatStacks) return;
-                int given = Give(player, info, left);
+                // the servings left as portions; an odd serving that makes no portion stays behind
+                int given = left / Cost() > 0 ? Give(player, info, left / Cost()) : 0;
                 if (given > 0)
                     player.Message(MessageHud.MessageType.TopLeft, "$msg_added " + info.Shared.m_name, given, info.Shared.m_icons[0], false);
             }

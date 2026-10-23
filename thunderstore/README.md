@@ -5,13 +5,13 @@ portion is gone the serving tray can no longer take it back: it stays where it s
 FeastPortions lets you carry it.
 
 - **Take a portion:** Shift + E on a placed feast puts one portion into your inventory instead of
-  eating it. A portion is an item of its own (*Plains Pie Picnic portion*, with a slice icon): it
-  has the feast's health, stamina, eitr and regeneration, lasts 25 minutes (configurable; the
+  eating it. A portion takes two servings, so a feast makes five portions to carry. A portion is an item of its own (*Plains Pie Picnic portion*, with a slice icon): it
+  has the feast's health, stamina, eitr and regeneration, lasts 30 minutes (configurable; the
   feast lasts 50) and stacks to ten. Eat it from the inventory, the hotbar or a slot mod's food
   slots. It never stacks with feasts and cannot be set out as one.
-- **Leftovers:** taking up a started feast with the serving tray gives you the portions left
-  (the game gives nothing). A whole feast still comes back as a whole feast.
-- **Set them out again:** dropping portions sets them out as a feast with that many portions,
+- **Leftovers:** taking up a started feast with the serving tray gives you the servings left
+  as portions (the game gives nothing). A whole feast still comes back as a whole feast.
+- **Set them out again:** dropping portions sets them out as a feast with the servings they took,
   for the group to eat or to take back.
 - **No empty trays:** the tray disappears once the last portion is taken or eaten.
 
@@ -26,4 +26,5 @@ owner may be a player without the mod. Players without it eat from the table as 
 - `LeftoversOnRemove` — the serving tray returns the portions left.
 - `DropAsFeast` — dropped portions become a feast; off: they drop as ordinary items.
 - `RemoveEmptyFeast` — the empty tray disappears after the last portion.
-- `Duration` — how long a portion lasts, in minutes (25).
+- `Cost` — servings of the feast one portion takes (2).
+- `Duration` — how long a portion lasts, in minutes (30).

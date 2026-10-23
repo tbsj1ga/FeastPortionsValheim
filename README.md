@@ -10,17 +10,20 @@ Version history is in `CHANGELOG.md`.
 
 ## How to use
 
-- **Shift + E** on a placed feast (the hover shows *Take a portion*): one portion goes into the
-  inventory instead of being eaten. Plain **E** eats as usual.
+- **Shift + E** on a placed feast (the hover shows *Take a portion (2 servings)*): one portion
+  goes into the inventory instead of being eaten. It takes two of the feast's servings (`Cost`):
+  a feast of ten makes five portions to carry. With a single serving left you can only eat it
+  there. Plain **E** eats one serving as usual.
 - A portion is an item of its own — *Plains Pie Picnic portion*, its icon the feast's with one
   slice in colour. It has the feast's health, stamina, eitr and regeneration and decays the same
-  way, but lasts 25 minutes instead of the feast's 50 (`Duration`). Eat it from the inventory, the
+  way, but lasts 30 minutes instead of the feast's 50 (`Duration`). Eat it from the inventory, the
   hotbar or the food slots of a slot mod. Portions stack to ten (a feast's portion count), never
   with feasts, and cannot be set out as a feast.
-- **Serving tray on a started feast:** you get the portions left. What does not fit into the
-  inventory is set out where you stand. A whole feast comes back whole, as in the game.
-- **Dropping portions** sets them out in front of you as a feast with that many portions (ten per
-  feast), so the group can eat from it or you can take them back. Portions spilled from a
+- **Serving tray on a started feast:** you get the servings left as portions, two servings each;
+  an odd serving left over is lost. What does not fit into the inventory is set out where you
+  stand. A whole feast comes back whole, as in the game.
+- **Dropping portions** sets them out in front of you as a feast with the servings they took (two
+  per portion, ten per feast), so the group can eat from it or you can take them back. Portions spilled from a
   destroyed chest or cart become a feast the same way.
 - **The empty tray** disappears once the last portion is taken or eaten (the game leaves it
   standing).
@@ -39,14 +42,14 @@ bite.
   stacks items and counts build materials by `SharedData.m_name`, and the feast's food shares its
   name with the kit the tray places. The portions are registered in `ObjectDB` (the inventory
   saves items by prefab name) and `ZNetScene`.
-- **Taking a portion.** Shift + E sends the feast's own `RPC_TryEat`; its owner counts a portion
-  off and answers `RPC_EatConfirmation`, where this client puts the portion into the inventory
+- **Taking a portion.** Shift + E sends the feast's own `RPC_TryEat` once per serving; its owner
+  counts each off and answers each with `RPC_EatConfirmation`, where this client puts the portion into the inventory
   instead of eating it. The owner needs no mod.
 - **Leftovers.** While `Player.RemovePiece` runs, a prefix on `WearNTear.Remove` (reached only once
-  every check has passed) reads the portions left of a started feast and puts them into the
-  inventory; the game then removes the feast as usual.
+  every check has passed) reads the servings left of a started feast and puts them into the
+  inventory as portions; the game then removes the feast as usual.
 - **Dropping.** `Humanoid.DropItem` and `ItemDrop.DropItem` set dropped portions out as a feast
-  with exactly that many portions, on the ground under the drop point (with `DropAsFeast` off,
+  with exactly the servings they took, on the ground under the drop point (with `DropAsFeast` off,
   they drop as ordinary items).
 - **The empty tray.** When the portion taken or eaten was the last one, the client asks the
   feast's owner to remove it (`WearNTear.Remove`, dropping nothing).
@@ -94,7 +97,8 @@ Through r2modman / Thunderstore, or put `build/FeastPortions.dll` into
 | 01 General | `LeftoversOnRemove` | `true` | the serving tray returns the portions left of a started feast |
 | 01 General | `DropAsFeast` | `true` | dropped portions are set out as a feast; off: they drop as ordinary items |
 | 01 General | `RemoveEmptyFeast` | `true` | the empty tray disappears after the last portion is taken or eaten |
-| 02 Portions | `Duration` | `25` | how long a portion lasts once eaten, in minutes (a feast: 50) |
+| 02 Portions | `Cost` | `2` | servings of the feast one portion takes (eating at the table: one) |
+| 02 Portions | `Duration` | `30` | how long a portion lasts once eaten, in minutes (a feast: 50) |
 
 ## Building
 
