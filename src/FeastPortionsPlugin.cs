@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using BepInEx;
 using BepInEx.Configuration;
 using HarmonyLib;
@@ -11,15 +12,17 @@ namespace FeastPortions
     // portions left when you take a started feast up with the serving tray.
     //
     // A placed feast is a piece with a Feast component: its portions are a counter in the ZDO
-    // (ZDOVars.s_value, starting at m_eatStacks), and every portion is the same food item - the
-    // feast's own ItemDrop (m_foodItem) - eaten with Player.EatFood. The game lets you take a
-    // feast back with the tray only whole: Piece.DropResources returns floor(1 x portions left /
-    // portions), so one bite and the feast is gone for good.
+    // (ZDOVars.s_value, starting at m_eatStacks), and every portion is the feast's own food item
+    // (m_foodItem) eaten with Player.EatFood. The game lets you take a feast back with the tray
+    // only whole: Piece.DropResources returns floor(1 x portions left / portions).
     //
-    // The portion in the inventory is that food item itself, so it eats like any food (inventory,
-    // hotbar, food slots of slot mods) with the feast's exact values. Its prefab is the feast
-    // piece, so whenever the game would drop it as a world item it would spawn a full feast
-    // instead; dropping portions therefore sets out a feast with as many portions as were dropped.
+    // The portion is an item of its own, one per feast ("<feast>_Portion"): a copy of the feast
+    // kit's world object (the kit is what the tray places) carrying a copy of the feast food's
+    // data under its own name, icon and duration. It cannot be the food item itself: the
+    // inventory stacks items and counts build materials by SharedData.m_name, and the feast's
+    // food and its kit share one name - a portion would join the kits and set out a whole feast.
+    // The portion prefabs are registered in ObjectDB (the inventory saves items by prefab name)
+    // and in ZNetScene (so a dropped portion lies in the world).
     //
     // Taking a portion goes through the feast's own RPC_TryEat: its owner counts the portion off
     // and answers RPC_EatConfirmation, where this client puts the portion into the inventory
@@ -34,17 +37,29 @@ namespace FeastPortions
 
         private sealed class FeastInfo
         {
-            public GameObject Piece;    // the placeable feast
-            public string Food;         // prefab name of the food item its portions are
+            public GameObject Piece;        // the placeable feast
+            public ItemDrop Food;           // the feast's own food item
             public int Portions;
+            public GameObject Portion;      // the portion's prefab
+            public ItemDrop.ItemData.SharedData Shared;
+        }
+
+        private sealed class Bite
+        {
+            public float Time;
+            public bool Take;               // into the inventory, not eaten
+            public bool Last;               // the feast had one portion left
         }
 
         private static ConfigEntry<bool> _takePortions;
         private static ConfigEntry<bool> _leftovers;
-        private static ConfigEntry<bool> _dropAsFeast;
+        private static ConfigEntry<bool> _removeEmpty;
+        private static ConfigEntry<float> _minutes;
 
+        private static readonly Dictionary<string, FeastInfo> _byPiece = new Dictionary<string, FeastInfo>(StringComparer.Ordinal);
         private static readonly Dictionary<string, FeastInfo> _byFood = new Dictionary<string, FeastInfo>(StringComparer.Ordinal);
-        private static readonly Dictionary<ZDOID, float> _pending = new Dictionary<ZDOID, float>();
+        private static readonly Dictionary<ZDOID, Bite> _bites = new Dictionary<ZDOID, Bite>();
+        private static GameObject _root;
         private static bool _removing;
 
         private Harmony _harmony;
@@ -55,8 +70,12 @@ namespace FeastPortions
                 "Shift + E (alt use) on a placed feast puts one portion into the inventory instead of eating it.");
             _leftovers = Config.Bind("01 General", "LeftoversOnRemove", true,
                 "Taking up a started feast with the serving tray gives the portions left (the game gives nothing). A whole feast still comes back whole.");
-            _dropAsFeast = Config.Bind("01 General", "DropAsFeast", true,
-                "Dropping portions from the inventory sets them out as a feast with that many portions. Off: portions cannot be dropped.");
+            _removeEmpty = Config.Bind("01 General", "RemoveEmptyFeast", true,
+                "The empty serving tray disappears once you take or eat the last portion (the game leaves it standing).");
+            _minutes = Config.Bind("02 Portions", "Duration", 25f,
+                new ConfigDescription("How long a portion lasts once eaten, in minutes. A feast eaten at the table lasts 50.",
+                    new AcceptableValueRange<float>(1f, 120f)));
+            _minutes.SettingChanged += delegate { foreach (FeastInfo f in _byPiece.Values) Dress(f); };
 
             _harmony = new Harmony(Guid);
             _harmony.PatchAll(typeof(FeastPortionsPlugin).Assembly);
@@ -78,16 +97,124 @@ namespace FeastPortions
             return Russian() ? ru : en;
         }
 
-        // ---- the feasts ----
+        // ---- the portions ----
 
-        // Every feast the serving trays (or any tool) can set out, by the food item its portions
-        // are. The food item becomes an inventory item: it goes into ObjectDB if the game left it
-        // out (the inventory saves and loads items by ObjectDB prefab name) and stacks to the
-        // feast's portion count.
+        // An inactive holder: copies made under it stay asleep (no ZNetView.Awake) and serve
+        // as prefabs; the game's own Instantiate wakes its copies.
+        private static Transform Root()
+        {
+            if (_root == null)
+            {
+                _root = new GameObject("FeastPortions_Prefabs");
+                _root.SetActive(false);
+                UnityEngine.Object.DontDestroyOnLoad(_root);
+            }
+            return _root.transform;
+        }
+
+        private static readonly MethodInfo _memberwiseClone =
+            typeof(object).GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic);
+
+        // The portion of one feast piece, made the first time the piece is seen.
+        private static FeastInfo Learn(GameObject piece)
+        {
+            if (piece == null) return null;
+            FeastInfo info;
+            if (_byPiece.TryGetValue(piece.name, out info)) return info;
+            Feast feast = piece.GetComponent<Feast>();
+            if (feast == null) return null;
+            ItemDrop food = feast.m_foodItem != null ? feast.m_foodItem : piece.GetComponent<ItemDrop>();
+            if (food == null || food.m_itemData == null || food.m_itemData.m_shared == null || food.m_itemData.m_shared.m_food <= 0f) return null;
+            Piece build = piece.GetComponent<Piece>();
+            ItemDrop kit = null;
+            if (build != null && build.m_resources != null)
+                foreach (Piece.Requirement req in build.m_resources)
+                    if (req != null && req.m_resItem != null) { kit = req.m_resItem; break; }
+            if (kit == null) return null;
+
+            GameObject go = UnityEngine.Object.Instantiate(kit.gameObject, Root(), false);
+            go.name = piece.name + "_Portion";
+            ItemDrop drop = go.GetComponent<ItemDrop>();
+            ItemDrop.ItemData.SharedData shared = (ItemDrop.ItemData.SharedData)_memberwiseClone.Invoke(food.m_itemData.m_shared, null);
+            drop.m_itemData.m_shared = shared;
+            drop.m_itemData.m_stack = 1;
+            drop.m_itemData.m_dropPrefab = go;
+
+            info = new FeastInfo();
+            info.Piece = piece;
+            info.Food = food;
+            info.Portions = Math.Max(1, feast.m_eatStacks);
+            info.Portion = go;
+            info.Shared = shared;
+            if (shared.m_icons != null && shared.m_icons.Length > 0 && shared.m_icons[0] != null)
+                shared.m_icons = new Sprite[] { SliceIcon(shared.m_icons[0]) };
+            Dress(info);
+            _byPiece[piece.name] = info;
+            _byFood[food.gameObject.name] = info;
+            return info;
+        }
+
+        // Name, description, stack and duration of a portion (again when the language or the
+        // config changes; items in inventories share this data).
+        private static void Dress(FeastInfo info)
+        {
+            ItemDrop.ItemData.SharedData food = info.Food.m_itemData.m_shared;
+            string feast = Localization.instance != null ? Localization.instance.Localize(food.m_name) : food.m_name;
+            string desc = Localization.instance != null ? Localization.instance.Localize(food.m_description) : food.m_description;
+            info.Shared.m_name = T(feast + " portion", "Кусочек: " + feast);
+            info.Shared.m_description = T("One portion of a feast, to eat on the road.", "Кусочек пира, чтобы съесть в пути.") + "\n\n" + desc;
+            info.Shared.m_maxStackSize = info.Portions;
+            info.Shared.m_foodBurnTime = Mathf.Max(1f, _minutes.Value) * 60f;
+        }
+
+        // The feast's icon as a slice: one wedge in full colour, the rest of the dish faded.
+        // The icon sits in a sprite atlas that cannot be read directly, so it is copied through
+        // a render texture. Any failure keeps the feast's own icon.
+        private static Sprite SliceIcon(Sprite src)
+        {
+            try
+            {
+                Rect r = src.textureRect;
+                Texture tex = src.texture;
+                RenderTexture rt = RenderTexture.GetTemporary(tex.width, tex.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                Graphics.Blit(tex, rt);
+                RenderTexture prev = RenderTexture.active;
+                RenderTexture.active = rt;
+                int w = Mathf.RoundToInt(r.width), h = Mathf.RoundToInt(r.height);
+                Texture2D t = new Texture2D(w, h, TextureFormat.RGBA32, false);
+                t.ReadPixels(new Rect(r.x, r.y, w, h), 0, 0);
+                t.Apply();
+                RenderTexture.active = prev;
+                RenderTexture.ReleaseTemporary(rt);
+
+                Color[] px = t.GetPixels();
+                float cx = w * 0.5f, cy = h * 0.5f;
+                for (int y = 0; y < h; y++)
+                    for (int x = 0; x < w; x++)
+                    {
+                        // the wedge points down and right: from -75 to +15 degrees around the centre
+                        float a = Mathf.Atan2(y - cy, x - cx) * Mathf.Rad2Deg;
+                        if (a >= -75f && a <= 15f) continue;
+                        Color c = px[y * w + x];
+                        float g = c.grayscale;
+                        px[y * w + x] = new Color(g, g, g, c.a * 0.3f);
+                    }
+                t.SetPixels(px);
+                t.Apply();
+                t.name = src.name + "_portion";
+                return Sprite.Create(t, new Rect(0, 0, w, h), new Vector2(0.5f, 0.5f), src.pixelsPerUnit);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[" + Name + "] portion icon kept as the feast's: " + e.Message);
+                return src;
+            }
+        }
+
+        // Every feast the build tools in this ObjectDB can set out; their portions go into it.
         private static void Register(ObjectDB db)
         {
             if (db == null || db.m_items == null) return;
-            List<GameObject> added = new List<GameObject>();
             foreach (GameObject go in db.m_items.ToArray())
             {
                 if (go == null) continue;
@@ -95,48 +222,37 @@ namespace FeastPortions
                 if (tool == null || tool.m_itemData == null || tool.m_itemData.m_shared == null) continue;
                 PieceTable table = tool.m_itemData.m_shared.m_buildPieces;
                 if (table == null || table.m_pieces == null) continue;
-                foreach (GameObject piece in table.m_pieces)
-                {
-                    if (piece == null) continue;
-                    Feast feast = piece.GetComponent<Feast>();
-                    if (feast == null) continue;
-                    ItemDrop food = feast.m_foodItem != null ? feast.m_foodItem : piece.GetComponent<ItemDrop>();
-                    if (food == null || food.m_itemData == null || food.m_itemData.m_shared == null) continue;
-                    if (food.m_itemData.m_shared.m_food <= 0f) continue;
-
-                    FeastInfo info = new FeastInfo();
-                    info.Piece = piece;
-                    info.Food = food.gameObject.name;
-                    info.Portions = Math.Max(1, feast.m_eatStacks);
-                    _byFood[info.Food] = info;
-
-                    if (food.m_itemData.m_shared.m_maxStackSize < info.Portions)
-                        food.m_itemData.m_shared.m_maxStackSize = info.Portions;
-                    if (db.GetItemPrefab(info.Food) == null && !added.Contains(food.gameObject))
-                        added.Add(food.gameObject);
-                }
+                foreach (GameObject piece in table.m_pieces) Learn(piece);
             }
-            if (added.Count == 0) return;
-            db.m_items.AddRange(added);
-            AccessTools.Method(typeof(ObjectDB), "UpdateRegisters").Invoke(db, null);
-            List<string> names = new List<string>();
-            foreach (GameObject go in added) names.Add(go.name);
-            Debug.Log("[" + Name + "] added to ObjectDB: " + string.Join(", ", names.ToArray()));
+            bool added = false;
+            foreach (FeastInfo info in _byPiece.Values)
+            {
+                Dress(info);
+                if (db.m_items.Contains(info.Portion)) continue;
+                db.m_items.Add(info.Portion);
+                added = true;
+            }
+            if (added) AccessTools.Method(typeof(ObjectDB), "UpdateRegisters").Invoke(db, null);
         }
 
-        private static FeastInfo InfoOf(ItemDrop.ItemData item)
+        private static readonly FieldInfo _namedPrefabs = AccessTools.Field(typeof(ZNetScene), "m_namedPrefabs");
+
+        private static void Register(ZNetScene scene)
         {
-            if (item == null || item.m_dropPrefab == null) return null;
-            FeastInfo info;
-            return _byFood.TryGetValue(item.m_dropPrefab.name, out info) ? info : null;
+            if (scene == null || scene.m_prefabs == null) return;
+            foreach (GameObject go in scene.m_prefabs.ToArray()) if (go != null && go.GetComponent<Feast>() != null) Learn(go);
+            Dictionary<int, GameObject> named = _namedPrefabs.GetValue(scene) as Dictionary<int, GameObject>;
+            foreach (FeastInfo info in _byPiece.Values)
+            {
+                if (!scene.m_prefabs.Contains(info.Portion)) scene.m_prefabs.Add(info.Portion);
+                if (named != null) named[info.Portion.name.GetStableHashCode()] = info.Portion;
+            }
         }
 
         private static FeastInfo InfoOf(Feast feast)
         {
-            ItemDrop food = feast.m_foodItem != null ? feast.m_foodItem : feast.GetComponent<ItemDrop>();
-            if (food == null) return null;
             FeastInfo info;
-            return _byFood.TryGetValue(Utils.GetPrefabName(food.gameObject), out info) ? info : null;
+            return _byPiece.TryGetValue(Utils.GetPrefabName(feast.gameObject), out info) ? info : Learn(ZNetScene.instance != null ? ZNetScene.instance.GetPrefab(Utils.GetPrefabName(feast.gameObject)) : null);
         }
 
         private static int PortionsLeft(Feast feast)
@@ -146,52 +262,34 @@ namespace FeastPortions
             return nview.GetZDO().GetInt(ZDOVars.s_value, feast.m_eatStacks);
         }
 
-        // Up to count portions into the player's inventory; returns how many went in.
+        // Up to count portions into the player's inventory, the rest on the ground at the player's
+        // feet; returns how many went into the inventory.
         private static int Give(Player player, FeastInfo info, int count)
         {
             Inventory inv = player.GetInventory();
             int given = 0;
-            while (given < count)
+            while (given < count && inv.AddItem(info.Portion.name, 1, 1, 0, 0L, "", false, true) != null) given++;
+            if (given < count)
             {
-                if (inv.AddItem(info.Food, 1, 1, 0, 0L, "", false, true) == null) break;
-                given++;
+                ItemDrop.ItemData item = info.Portion.GetComponent<ItemDrop>().m_itemData.Clone();
+                item.m_dropPrefab = info.Portion;
+                item.m_stack = count - given;
+                Transform t = player.transform;
+                ItemDrop.DropItem(item, item.m_stack, t.position + t.forward * 0.7f + Vector3.up, t.rotation);
+                player.Message(MessageHud.MessageType.Center, "$inventory_full", 0, null, false);
             }
             return given;
         }
 
-        private static bool HasRoom(Player player, FeastInfo info)
+        // Takes an emptied feast away: the owner removes it, dropping nothing.
+        private static void RemoveEmpty(Feast feast)
         {
-            GameObject prefab = ObjectDB.instance != null ? ObjectDB.instance.GetItemPrefab(info.Food) : null;
-            return prefab != null && player.GetInventory().CanAddItem(prefab, 1);
+            if (!_removeEmpty.Value || feast == null) return;
+            WearNTear wnt = feast.GetComponent<WearNTear>();
+            if (wnt != null) wnt.Remove(true);
         }
 
-        // Sets out a feast (or several, ten portions each) with the given portions at a point.
-        private static void SetOut(FeastInfo info, int portions, Vector3 pos, Quaternion rot)
-        {
-            while (portions > 0)
-            {
-                int n = Math.Min(portions, info.Portions);
-                portions -= n;
-                GameObject go = UnityEngine.Object.Instantiate(info.Piece, pos, rot);
-                ZNetView nview = go.GetComponent<ZNetView>();
-                if (nview != null && nview.IsValid()) nview.GetZDO().Set(ZDOVars.s_value, n, false);
-                pos += rot * new Vector3(0.6f, 0f, 0f);
-            }
-        }
-
-        // The ground under a point (terrain, pieces, rocks), or false over water and the void.
-        private static bool Ground(Vector3 from, out Vector3 point)
-        {
-            point = from;
-            int mask = LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain", "vehicle");
-            RaycastHit hit;
-            if (!Physics.Raycast(from + Vector3.up * 1.5f, Vector3.down, out hit, 6f, mask)) return false;
-            if (ZoneSystem.instance != null && hit.point.y < ZoneSystem.instance.m_waterLevel - 0.3f) return false;
-            point = hit.point;
-            return true;
-        }
-
-        // ---- database ----
+        // ---- registration ----
 
         [HarmonyPatch(typeof(ObjectDB), "Awake")]
         private static class ObjectDB_Awake_Patch
@@ -205,66 +303,96 @@ namespace FeastPortions
             private static void Postfix(ObjectDB __instance) { Register(__instance); }
         }
 
-        // ---- B: take a portion ----
+        [HarmonyPatch(typeof(ZNetScene), "Awake")]
+        private static class ZNetScene_Awake_Patch
+        {
+            private static void Postfix(ZNetScene __instance) { Register(__instance); }
+        }
+
+        // An early build put the feast's food item itself into inventories: those become portions.
+        [HarmonyPatch(typeof(Inventory), "Load")]
+        private static class Inventory_Load_Patch
+        {
+            private static void Postfix(Inventory __instance)
+            {
+                foreach (ItemDrop.ItemData item in __instance.GetAllItems())
+                {
+                    FeastInfo info;
+                    if (item == null || item.m_dropPrefab == null || !_byFood.TryGetValue(item.m_dropPrefab.name, out info)) continue;
+                    item.m_shared = info.Shared;
+                    item.m_dropPrefab = info.Portion;
+                }
+            }
+        }
+
+        // ---- taking and eating ----
 
         [HarmonyPatch(typeof(Feast), "Interact")]
         private static class Feast_Interact_Patch
         {
             private static bool Prefix(Feast __instance, Humanoid human, bool hold, bool alt, ref bool __result)
             {
+                ZNetView nview = __instance.GetComponent<ZNetView>();
+                if (nview == null || !nview.IsValid() || hold) return true;
+                int left = PortionsLeft(__instance);
+                Bite bite = new Bite();
+                bite.Time = Time.time;
+                bite.Last = left == 1;
+
                 if (!alt || !_takePortions.Value)
                 {
-                    // eating normally: an unanswered take must not turn this bite into a portion
-                    ZNetView own = __instance.GetComponent<ZNetView>();
-                    if (own != null && own.IsValid()) _pending.Remove(own.GetZDO().m_uid);
+                    // eating at the table: noted only to clear the tray after the last portion
+                    _bites[nview.GetZDO().m_uid] = bite;
                     return true;
                 }
+
                 __result = false;
                 Player player = human as Player;
-                if (hold || player == null || player != Player.m_localPlayer) return false;
+                if (player == null || player != Player.m_localPlayer || left <= 0) return false;
                 if (Vector3.Distance(player.transform.position, __instance.transform.position) >= __instance.m_useDistance) return false;
-                if (PortionsLeft(__instance) <= 0) return false;
                 FeastInfo info = InfoOf(__instance);
-                ZNetView nview = __instance.GetComponent<ZNetView>();
-                if (info == null || nview == null || !nview.IsValid()) return false;
-                if (!HasRoom(player, info))
+                if (info == null) return false;
+                if (!player.GetInventory().CanAddItem(info.Portion, 1))
                 {
                     player.Message(MessageHud.MessageType.Center, "$inventory_full", 0, null, false);
                     return false;
                 }
-                _pending[nview.GetZDO().m_uid] = Time.time;
+                bite.Take = true;
+                _bites[nview.GetZDO().m_uid] = bite;
                 nview.InvokeRPC("RPC_TryEat", new object[0]);
                 __result = true;
                 return false;
             }
         }
 
-        // The owner counted a portion off for this player: into the inventory instead of eaten.
+        // The owner counted a portion off for this player: into the inventory when taken, eaten
+        // otherwise; after the last one the empty tray goes away.
         [HarmonyPatch(typeof(Feast), "RPC_EatConfirmation")]
         private static class Feast_RPC_EatConfirmation_Patch
         {
-            private static bool Prefix(Feast __instance)
+            private static bool Prefix(Feast __instance, out Bite __state)
             {
+                __state = null;
                 ZNetView nview = __instance.GetComponent<ZNetView>();
                 if (nview == null || !nview.IsValid()) return true;
                 ZDOID id = nview.GetZDO().m_uid;
-                float asked;
-                if (!_pending.TryGetValue(id, out asked)) return true;
-                _pending.Remove(id);
-                if (Time.time - asked > 5f) return true;
+                Bite bite;
+                if (!_bites.TryGetValue(id, out bite)) return true;
+                _bites.Remove(id);
+                if (Time.time - bite.Time > 5f) return true;
+                __state = bite;
+                if (!bite.Take) return true;
                 Player player = Player.m_localPlayer;
                 FeastInfo info = InfoOf(__instance);
                 if (player == null || info == null) return true;
-                if (Give(player, info, 1) == 0)
-                {
-                    // the inventory filled up meanwhile: the portion is not lost, it stands as a feast
-                    Vector3 at;
-                    if (!Ground(player.transform.position + player.transform.forward, out at)) at = player.transform.position;
-                    SetOut(info, 1, at, player.transform.rotation);
-                    return false;
-                }
-                player.Message(MessageHud.MessageType.TopLeft, "$msg_added " + __instance.GetHoverName(), 1, null, false);
+                if (Give(player, info, 1) > 0)
+                    player.Message(MessageHud.MessageType.TopLeft, "$msg_added " + info.Shared.m_name, 1, info.Shared.m_icons[0], false);
                 return false;
+            }
+
+            private static void Postfix(Feast __instance, Bite __state)
+            {
+                if (__state != null && __state.Last) RemoveEmpty(__instance);
             }
         }
 
@@ -276,11 +404,11 @@ namespace FeastPortions
                 if (!_takePortions.Value || string.IsNullOrEmpty(__result) || Player.m_localPlayer == null) return;
                 if (Vector3.Distance(Player.m_localPlayer.transform.position, __instance.transform.position) >= __instance.m_useDistance) return;
                 __result += Localization.instance.Localize("\n[<color=yellow><b>$KEY_AltPlace + $KEY_Use</b></color>] ")
-                    + T("Take a portion", "Взять кусок");
+                    + T("Take a portion", "Взять кусочек");
             }
         }
 
-        // ---- A: the leftovers when taking a started feast up ----
+        // ---- the leftovers when taking a started feast up ----
 
         [HarmonyPatch(typeof(Player), "RemovePiece")]
         private static class Player_RemovePiece_Patch
@@ -305,59 +433,8 @@ namespace FeastPortions
                 int left = PortionsLeft(feast);
                 if (left <= 0 || left >= feast.m_eatStacks) return;
                 int given = Give(player, info, left);
-                if (given < left)
-                {
-                    // what does not fit stays where the feast stood
-                    SetOut(info, left - given, __instance.transform.position, __instance.transform.rotation);
-                    player.Message(MessageHud.MessageType.Center, "$inventory_full", 0, null, false);
-                }
                 if (given > 0)
-                    player.Message(MessageHud.MessageType.TopLeft, "$msg_added " + feast.GetHoverName(), given, null, false);
-            }
-        }
-
-        // ---- dropping portions ----
-
-        // The player drops portions: they are set out as a feast in front of the player.
-        [HarmonyPatch(typeof(Humanoid), "DropItem")]
-        private static class Humanoid_DropItem_Patch
-        {
-            private static bool Prefix(Humanoid __instance, Inventory inventory, ItemDrop.ItemData item, int amount, ref bool __result)
-            {
-                FeastInfo info = InfoOf(item);
-                if (info == null) return true;
-                __result = false;
-                Vector3 at;
-                if (!_dropAsFeast.Value || !Ground(__instance.transform.position + __instance.transform.forward * 1.2f, out at))
-                {
-                    __instance.Message(MessageHud.MessageType.Center, "$msg_cantdrop", 0, null, false);
-                    return false;
-                }
-                if (inventory == null) inventory = __instance.GetInventory();
-                if (amount <= 0 || amount > item.m_stack) amount = item.m_stack;
-                if (!inventory.RemoveItem(item, amount)) return false;
-                Quaternion rot = Quaternion.Euler(0f, __instance.transform.rotation.eulerAngles.y + 180f, 0f);
-                SetOut(info, amount, at, rot);
-                __result = true;
-                return false;
-            }
-        }
-
-        // Anything else dropping portions into the world (a destroyed chest or cart spilling its
-        // contents): a feast with that many portions instead of a full feast per stack.
-        [HarmonyPatch(typeof(ItemDrop), "DropItem")]
-        private static class ItemDrop_DropItem_Patch
-        {
-            private static bool Prefix(ItemDrop.ItemData item, int amount, Vector3 position, Quaternion rotation, ref ItemDrop __result)
-            {
-                FeastInfo info = InfoOf(item);
-                if (info == null) return true;
-                if (amount <= 0 || amount > item.m_stack) amount = item.m_stack;
-                Vector3 at;
-                if (!Ground(position, out at)) at = position;
-                SetOut(info, amount, at, Quaternion.Euler(0f, rotation.eulerAngles.y, 0f));
-                __result = null;
-                return false;
+                    player.Message(MessageHud.MessageType.TopLeft, "$msg_added " + info.Shared.m_name, given, info.Shared.m_icons[0], false);
             }
         }
     }

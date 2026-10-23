@@ -2,7 +2,7 @@
   "name": "FeastPortions",
   "version_number": "0.0.0",
   "website_url": "https://github.com/tbsj1ga/FeastPortionsValheim",
-  "description": "Carry feasts: take portions off a placed feast into your inventory and get the leftovers back with the serving tray. Client-side.",
+  "description": "Carry feasts: take portions off a placed feast into your inventory, get the leftovers back with the serving tray. Client-side.",
   "dependencies": [
     "denikson-BepInExPack_Valheim-5.4.2350"
   ]
