@@ -14,6 +14,9 @@ FeastPortions lets you carry it.
 - **Set them out again:** dropping portions sets them out as a feast with the servings they took,
   for the group to eat or to take back.
 - **No empty trays:** the tray disappears once the last portion is taken or eaten.
+- **Kept out of chests:** portions stay in your inventory (a tombstone still takes them), since
+  a player without the mod would lose them in a shared chest. Turn it off if everyone has the
+  mod.
 
 Client-side: no version check, the host and a dedicated server need nothing, and the feast's
 owner may be a player without the mod. Players without it eat from the table as usual.
@@ -25,6 +28,7 @@ owner may be a player without the mod. Players without it eat from the table as 
 - `TakePortions` — Shift + E takes a portion.
 - `LeftoversOnRemove` — the serving tray returns the portions left.
 - `DropAsFeast` — dropped portions become a feast; off: they drop as ordinary items.
+- `KeepOutOfChests` — portions cannot go into chests, carts or ship storage.
 - `RemoveEmptyFeast` — the empty tray disappears after the last portion.
 - `Cost` — servings of the feast one portion takes (2).
 - `Duration` — how long a portion lasts, in minutes (30).

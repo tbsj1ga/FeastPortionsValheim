@@ -27,6 +27,10 @@ Version history is in `CHANGELOG.md`.
   destroyed chest or cart become a feast the same way.
 - **The empty tray** disappears once the last portion is taken or eaten (the game leaves it
   standing).
+- **Not in chests:** portions cannot be put into chests, carts or ship storage
+  (`KeepOutOfChests`); a tombstone still takes them when you die. A player without the mod does
+  not see a portion in a chest, and once they move anything in it the chest is saved without
+  it. In a group where everyone has the mod, turn it off.
 
 ## How it works
 
@@ -96,6 +100,7 @@ Through r2modman / Thunderstore, or put `build/FeastPortions.dll` into
 | 01 General | `TakePortions` | `true` | Shift + E on a feast puts a portion into the inventory |
 | 01 General | `LeftoversOnRemove` | `true` | the serving tray returns the portions left of a started feast |
 | 01 General | `DropAsFeast` | `true` | dropped portions are set out as a feast; off: they drop as ordinary items |
+| 01 General | `KeepOutOfChests` | `true` | portions cannot go into chests, carts or ship storage (a tombstone still takes them) |
 | 01 General | `RemoveEmptyFeast` | `true` | the empty tray disappears after the last portion is taken or eaten |
 | 02 Portions | `Cost` | `2` | servings of the feast one portion takes (eating at the table: one) |
 | 02 Portions | `Duration` | `30` | how long a portion lasts once eaten, in minutes (a feast: 50) |

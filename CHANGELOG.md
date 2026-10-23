@@ -4,6 +4,13 @@
 
 The version is set in one place — `FeastPortionsPlugin.Version` in `src/FeastPortionsPlugin.cs`.
 
+## 0.1.1
+
+- Portions stay out of chests, carts and ship storage (`KeepOutOfChests`, on by default; a
+  tombstone still takes them). A player without the mod does not see a portion in a chest,
+  and once they move anything in it the chest is saved without it. Turn it off in a group
+  where everyone has the mod.
+
 ## 0.1.0
 
 - First release. Shift + E on a placed feast puts a portion into the inventory: an item of its

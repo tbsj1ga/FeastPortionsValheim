@@ -33,7 +33,7 @@ namespace FeastPortions
     {
         public const string Guid = "j1ga.feastportions";
         public const string Name = "FeastPortions";
-        public const string Version = "0.1.0";
+        public const string Version = "0.1.1";
 
         private sealed class FeastInfo
         {
@@ -56,6 +56,7 @@ namespace FeastPortions
         private static ConfigEntry<bool> _takePortions;
         private static ConfigEntry<bool> _leftovers;
         private static ConfigEntry<bool> _removeEmpty;
+        private static ConfigEntry<bool> _keepOut;
         private static ConfigEntry<bool> _dropAsFeast;
         private static ConfigEntry<float> _minutes;
         private static ConfigEntry<int> _cost;
@@ -77,6 +78,8 @@ namespace FeastPortions
                 "Taking up a started feast with the serving tray gives the portions left (the game gives nothing). A whole feast still comes back whole.");
             _dropAsFeast = Config.Bind("01 General", "DropAsFeast", true,
                 "Dropped portions are set out as a feast again, with the servings they took. Off: they drop as ordinary items.");
+            _keepOut = Config.Bind("01 General", "KeepOutOfChests", true,
+                "Portions cannot be put into chests, carts or ship storage (a tombstone still takes them). A player without the mod does not see a portion in a chest, and once they move anything in it the chest is saved without it. Off: for groups where everyone has the mod.");
             _removeEmpty = Config.Bind("01 General", "RemoveEmptyFeast", true,
                 "The empty serving tray disappears once you take or eat the last portion (the game leaves it standing).");
             _cost = Config.Bind("02 Portions", "Cost", 2,
@@ -343,6 +346,100 @@ namespace FeastPortions
             if (!_removeEmpty.Value || feast == null) return;
             WearNTear wnt = feast.GetComponent<WearNTear>();
             if (wnt != null) wnt.Remove(true);
+        }
+
+        // ---- keeping portions out of chests ----
+
+        // Every container's inventory, to tell a chest from the player's own inventory: the
+        // inventory itself does not know whose it is.
+        private static readonly Dictionary<Inventory, Container> _containers = new Dictionary<Inventory, Container>();
+        private static float _keepOutMessage;
+
+        [HarmonyPatch(typeof(Container), "Awake")]
+        private static class Container_Awake_Patch
+        {
+            private static void Postfix(Container __instance)
+            {
+                Inventory inv = __instance.GetInventory();
+                if (inv == null) return;
+                if (_containers.Count > 4000)
+                {
+                    List<Inventory> gone = new List<Inventory>();
+                    foreach (KeyValuePair<Inventory, Container> kv in _containers) if (kv.Value == null) gone.Add(kv.Key);
+                    foreach (Inventory g in gone) _containers.Remove(g);
+                }
+                _containers[inv] = __instance;
+            }
+        }
+
+        // A portion going into a container that is not a tombstone. The game loads a chest's
+        // contents through other AddItem overloads, so portions already in a chest still load.
+        private static bool KeptOut(Inventory inv, ItemDrop.ItemData item)
+        {
+            if (!_keepOut.Value || inv == null || InfoOf(item) == null) return false;
+            Container c;
+            if (!_containers.TryGetValue(inv, out c)) return false;
+            if (c == null) { _containers.Remove(inv); return false; }
+            if (c.GetComponent<TombStone>() != null) return false;
+            if (Player.m_localPlayer != null && Time.time - _keepOutMessage > 1f)
+            {
+                _keepOutMessage = Time.time;
+                Player.m_localPlayer.Message(MessageHud.MessageType.Center,
+                    T("Feast portions stay with you: players without the mod would lose them in a chest",
+                      "Кусочки пира не кладутся в сундуки: у игроков без мода они бы пропали"), 0, null, false);
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(Inventory), "AddItem", new Type[] { typeof(ItemDrop.ItemData) })]
+        private static class Inventory_AddItem_Patch
+        {
+            private static bool Prefix(Inventory __instance, ItemDrop.ItemData item, ref bool __result)
+            {
+                if (!KeptOut(__instance, item)) return true;
+                __result = false;
+                return false;
+            }
+        }
+
+        [HarmonyPatch(typeof(Inventory), "AddItem", new Type[] { typeof(ItemDrop.ItemData), typeof(Vector2i) })]
+        private static class Inventory_AddItemAt_Patch
+        {
+            private static bool Prefix(Inventory __instance, ItemDrop.ItemData item, ref bool __result)
+            {
+                if (!KeptOut(__instance, item)) return true;
+                __result = false;
+                return false;
+            }
+        }
+
+        // The one moves within the inventory screen use (MoveItemToThis, MoveAll)
+        [HarmonyPatch(typeof(Inventory), "AddItem", new Type[] { typeof(ItemDrop.ItemData), typeof(int), typeof(int), typeof(int), typeof(bool) })]
+        private static class Inventory_AddItemXY_Patch
+        {
+            private static bool Prefix(Inventory __instance, ItemDrop.ItemData item, ref bool __result)
+            {
+                if (!KeptOut(__instance, item)) return true;
+                __result = false;
+                return false;
+            }
+        }
+
+        // Dropping a single item from a chest onto a portion swaps them: the game takes the
+        // item out of the chest first and then moves the portion in. With the portion kept out
+        // the item would be left nowhere, so such a drop is refused as a whole.
+        [HarmonyPatch(typeof(InventoryGrid), "DropItem")]
+        private static class InventoryGrid_DropItem_Patch
+        {
+            private static bool Prefix(InventoryGrid __instance, Inventory fromInventory, Vector2i pos, ref bool __result)
+            {
+                Inventory target = __instance.GetInventory();
+                if (target == null || target == fromInventory) return true;
+                ItemDrop.ItemData there = target.GetItemAt(pos.x, pos.y);
+                if (there == null || !KeptOut(fromInventory, there)) return true;
+                __result = false;
+                return false;
+            }
         }
 
         // ---- registration ----
